@@ -1,38 +1,41 @@
-const express = require('express');
-const { Pool } = require('pg');
-const axios = require('axios');
+import express from 'express';
+import knex from 'knex';
+import axios from 'axios';
+import { convertDurationToSeconds } from './utils.js';
 
 const app = express();
 const port = 3000;
 
-const pool = new Pool({
-    user: 'user',
-    host: 'localhost',
-    database: 'call_stats_db',
-    password: 'pass',
-    port: 5432,
+const db = knex({
+    client: 'pg',
+    connection: {
+        user: 'user',
+        password: 'pass',
+        database: 'call_stats_db',
+        host: 'localhost',
+        port: 5432,
+    },
+    pool: { min: 2, max: 10 },
 });
-
-const convertDurationToSeconds = (duration) => {
-    const parts = duration.split(':');
-    const hours = parseInt(parts[0], 10);
-    const minutes = parseInt(parts[1], 10);
-    const seconds = parseInt(parts[2], 10);
-    return hours * 3600 + minutes * 60 + seconds;
-}
 
 app.get('/aggregate_stats', async (req, res) => {
     try {
-        const result = await pool.query(`
-      SELECT agent_id,
-             COUNT(*) AS total_calls,
-             COUNT(recording_file) AS calls_with_recording,
-             COUNT(*) - COUNT(recording_file) AS calls_without_recording,
-             SUM(duration) AS total_duration
-      FROM call_records
-      GROUP BY agent_id
-    `);
-        res.json(result.rows);
+        const results = await db('call_records')
+            .select('agent_id')
+            .count('* as total_calls')
+            .count('recording_file as calls_with_recording')
+            .sum('duration as total_duration')
+            .groupBy('agent_id');
+
+        const stats = results.map(row => ({
+            agent_id: row.agent_id,
+            total_calls: parseInt(row.total_calls, 10),
+            calls_with_recording: parseInt(row.calls_with_recording, 10),
+            calls_without_recording: parseInt(row.total_calls, 10) - parseInt(row.calls_with_recording, 10),
+            total_duration: parseInt(row.total_duration, 10)
+        }));
+
+        res.json(stats);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -43,13 +46,13 @@ const fetchAndStoreData = async () => {
         const response = await axios.get(`https://omni.salox.tech/api/v1/fdb659ec6744d718610e47647efbbd7bce77fe025e443dev/cdr?page=${page}`);
         const records = response.data.records;
 
-        for (const record of records) {
-            const durationInSeconds = convertDurationToSeconds(record.duration);
-            await pool.query(
-                'INSERT INTO call_records (agent_id, recording_file, duration) VALUES ($1, $2, $3)',
-                [record.agent_id || null, record.recording_file || null, durationInSeconds]
-            );
-        }
+        const formattedRecords = records.map(record => ({
+            agent_id: record.agent_id,
+            recording_file: record.recording_file || null,
+            duration: convertDurationToSeconds(record.duration)
+        }));
+
+        await db('call_records').insert(formattedRecords);
     }
 }
 
